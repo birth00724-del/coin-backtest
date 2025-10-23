@@ -5,7 +5,7 @@ import plotly.graph_objects as go
 
 st.set_page_config(page_title="업비트 전략 백테스터", layout="wide")
 st.title("📈 업비트 전략 백테스터")
-st.caption("기본 CSV 자동 로드 + 업로드 교체 가능 / 전략 선택 시 해당 파라미터만 표시 / 매매내역 CSV 다운로드 지원")
+st.caption("기본 CSV 자동 로드 + 업로드 교체 가능 / 전략별 파라미터 / 매매내역 CSV(매수·매도·수익률·슬리피지반영) 다운로드")
 
 # --------------------- Sidebar: Global Controls ---------------------
 st.sidebar.header("⚙️ 공통 설정")
@@ -190,103 +190,54 @@ def metrics_from_curve(curve: pd.Series, rf_daily: float = 0.0001):
     win_rate = (daily_ret > 0).mean()
     return final_cap, cagr, mdd, sharpe, win_rate
 
-# --------------------- Trade Log Generator ---------------------
-def generate_trade_log(df: pd.DataFrame, signal: pd.Series, slippage: float) -> pd.DataFrame:
+# --------------------- Trade extractor (LONG only) ---------------------
+def extract_long_trades(df: pd.DataFrame, signal: pd.Series, slippage: float) -> pd.DataFrame:
     """
-    체결가는 '신호가 변한 날의 종가'로 기록.
-    직전 체결가 대비 구간 수익률(raw_return)을 계산하고,
-    adj_return = raw_return - slippage * abs(new_pos - old_pos) 로 조정.
+    매수 기준: signal이 0/음수 → 양수(>0)로 바뀌는 날의 종가
+    매도 기준: signal이 양수(>0) → 0/음수로 바뀌는 날의 종가
+    수익률(raw) = 매도가/매수가 - 1
+    슬리피지 반영 수익률(adj) = raw - 2*slippage  (진입 1회 + 청산 1회)
     """
-    sig = signal.dropna().astype(float)
-    if sig.empty:
-        return pd.DataFrame()
+    sig = signal.fillna(0).astype(float)
+    # 엔트리/엑싯 포인트 탐지
+    entry_idx = sig[(sig.shift(1).fillna(0) <= 0) & (sig > 0)].index
+    exit_idx  = sig[(sig.shift(1).fillna(0) > 0) & (sig <= 0)].index
 
-    # 신호가 바뀌는 시점(포지션 변경 시점)
-    sig_change = sig.diff().fillna(0)
-    change_idx = list(sig_change[sig_change != 0].index)
+    entries = list(entry_idx)
+    exits = list(exit_idx)
 
-    if not change_idx:
-        return pd.DataFrame()  # 트레이드 없음
+    trades = []
+    ei = xi = 0
+    while ei < len(entries):
+        buy_date = entries[ei]
+        # 대응되는 매도일 찾기: buy_date 이후 첫 번째 exit
+        sell_date = None
+        while xi < len(exits):
+            if exits[xi] > buy_date:
+                sell_date = exits[xi]
+                xi += 1
+                break
+            xi += 1
+        # 매도일 없으면 마지막 날짜를 청산 시점으로 가정(평가상 종료)
+        if sell_date is None:
+            sell_date = df.index[-1]
 
-    logs = []
-    # 초기 엔트리: 첫 변화 이전의 포지션을 알기 위해 이전 값 가져오기
-    prev_idx = change_idx[0]
-    # 첫 체결은 prev_idx 시점에서 old_pos -> new_pos로 변경
-    old_pos = sig.loc[:prev_idx].iloc[:-1].iloc[-1] if len(sig.loc[:prev_idx]) > 1 else 0.0
-    entry_time = prev_idx
-    entry_price = df.loc[entry_time, "Close"]
-    # 첫 체결 로그(진입 자체에 대한 return은 계산 대상 아님, 다음 체결 때 계산)
-    logs.append({
-        "date": entry_time, "action": "ENTER",
-        "old_pos": float(old_pos), "new_pos": float(sig.loc[entry_time]),
-        "price": float(entry_price),
-        "raw_return_%": np.nan, "adj_return_%": np.nan,
-        "slippage_applied_%": slippage * abs(sig.loc[entry_time] - old_pos) * 100
-    })
-    last_pos = sig.loc[entry_time]
-    last_price = entry_price
-    last_time = entry_time
+        buy_price = float(df.loc[buy_date, "Close"])
+        sell_price = float(df.loc[sell_date, "Close"])
+        raw = (sell_price / buy_price) - 1.0
+        adj = raw - 2.0 * slippage  # 진입(1) + 청산(1)
 
-    # 이후 변경들: 각 변경 시 이전 구간의 수익률을 계산
-    for t in change_idx[1:]:
-        px = df.loc[t, "Close"]
-        new_pos = sig.loc[t]
-
-        # 직전 포지션(last_pos)으로 last_time→t 구간 보유했다고 가정
-        if last_pos > 0:  # long
-            raw_ret = (px / last_price) - 1.0
-        elif last_pos < 0:  # short
-            raw_ret = (last_price / px) - 1.0
-        else:  # flat
-            raw_ret = 0.0
-
-        slip = slippage * abs(new_pos - last_pos)
-        adj_ret = raw_ret - slip
-
-        logs.append({
-            "date": t,
-            "action": "SWITCH",
-            "old_pos": float(last_pos),
-            "new_pos": float(new_pos),
-            "price": float(px),
-            "raw_return_%": raw_ret * 100.0,
-            "adj_return_%": adj_ret * 100.0,
-            "slippage_applied_%": slip * 100.0
+        trades.append({
+            "매수일": buy_date.date(),
+            "매수가": buy_price,
+            "매도일": sell_date.date(),
+            "매도가": sell_price,
+            "수익률(%)": raw * 100.0,
+            "슬리피지반영 수익률(%)": adj * 100.0
         })
+        ei += 1
 
-        last_pos = new_pos
-        last_price = px
-        last_time = t
-
-    # 마지막 구간을 종가로 정산(마지막 날짜)
-    final_t = df.index[-1]
-    if final_t > last_time:
-        px = df.loc[final_t, "Close"]
-        # 마지막 시점에 포지션을 '유지'한 채 평가손익을 계산하고 'EXIT'로 표기(평가상 정리)
-        if last_pos > 0:
-            raw_ret = (px / last_price) - 1.0
-        elif last_pos < 0:
-            raw_ret = (last_price / px) - 1.0
-        else:
-            raw_ret = 0.0
-
-        # 마지막은 포지션 유지 → 0으로 청산한다고 가정하면 슬리피지 × |0 - last_pos|
-        slip = slippage * abs(0 - last_pos)
-        adj_ret = raw_ret - slip
-
-        logs.append({
-            "date": final_t,
-            "action": "EXIT",
-            "old_pos": float(last_pos),
-            "new_pos": 0.0,
-            "price": float(px),
-            "raw_return_%": raw_ret * 100.0,
-            "adj_return_%": adj_ret * 100.0,
-            "slippage_applied_%": slip * 100.0
-        })
-
-    trade_log = pd.DataFrame(logs).sort_values("date").reset_index(drop=True)
-    return trade_log
+    return pd.DataFrame(trades)
 
 # --------------------- Compute & Output ---------------------
 if not chosen_strategies:
@@ -295,23 +246,24 @@ if not chosen_strategies:
 
 curves = {}
 rows = []
-trade_logs = {}
+trade_tables = {}
 
 for name in chosen_strategies:
     rets, sig = run_strategy(name, data)
     curve = curve_from_returns(rets, initial_capital)
     final_cap, cagr, mdd, sharpe, win_rate = metrics_from_curve(curve)
+
     curves[name] = curve
     rows.append([
         name, f"{initial_capital:,.2f}", f"{final_cap:,.2f}",
         f"{cagr*100:.2f}%", f"{win_rate*100:.1f}%", f"{mdd*100:.2f}%", f"{sharpe:.2f}"
     ])
 
-    # 매매내역 생성 (체결가는 종가, 수익률은 슬리피지 차감 방식)
-    log_df = generate_trade_log(data, sig, slippage)
-    trade_logs[name] = log_df
+    # LONG 트레이드 테이블 생성 (요청 포맷)
+    trade_df = extract_long_trades(data, sig, slippage)
+    trade_tables[name] = trade_df
 
-# 동일 비중 포트폴리오(차트/요약만, 로그는 개별 전략 위주)
+# 동일 비중 포트폴리오(차트/요약만)
 if len(chosen_strategies) >= 2:
     aligned = pd.concat([curve.pct_change().fillna(0) for curve in curves.values()], axis=1).mean(axis=1)
     port_curve = curve_from_returns(aligned, initial_capital)
@@ -352,19 +304,19 @@ with col2:
     out = pd.DataFrame(rows, columns=["전략", "초기자금", "최종자금", "CAGR", "승률", "MDD", "샤프"])
     st.dataframe(out, use_container_width=True)
 
-    st.markdown("### ⬇️ 전략별 매매내역 CSV 다운로드")
+    st.markdown("### ⬇️ 전략별 매매내역 CSV 다운로드 (LONG Trades)")
     for name in chosen_strategies:
-        log_df = trade_logs.get(name)
-        if log_df is None or log_df.empty:
-            st.button(f"{name} 로그 (거래 없음)", disabled=True, key=f"btn_{name}")
+        tdf = trade_tables.get(name)
+        if tdf is None or tdf.empty:
+            st.button(f"{name} (거래 없음)", disabled=True, key=f"btn_{name}")
         else:
-            csv = log_df.to_csv(index=False).encode("utf-8-sig")
+            csv = tdf.to_csv(index=False).encode("utf-8-sig")
             st.download_button(
                 label=f"{name} 매매내역 CSV 다운로드",
                 data=csv,
-                file_name=f"tradelog_{name}.csv",
+                file_name=f"trades_{name}.csv",
                 mime="text/csv",
                 key=f"dl_{name}"
             )
 
-st.success("완료! 매매내역 CSV에 raw_return과 슬리피지 차감 adj_return이 포함됩니다.")
+st.success("완료! CSV에는 매수일/매수가/매도일/매도가/수익률/슬리피지반영 수익률이 포함됩니다.")
