@@ -65,34 +65,48 @@ st.sidebar.header("📌 전략 선택")
 strategy_options = ["이동평균", "거래량돌파", "OBV", "VWAP"]
 chosen_strategies = st.sidebar.multiselect("전략(복수 선택 가능)", strategy_options, default=["이동평균", "VWAP"])
 
-# --------------------- Strategy Parameters ---------------------
+# --------------------- Strategy Parameters (only for selected) ---------------------
 st.sidebar.markdown("---")
 st.sidebar.header("🧪 전략 파라미터")
 
-with st.sidebar.expander("이동평균 (MA Cross)", expanded=True):
-    ma_short = st.number_input("단기 MA 기간", min_value=2, value=20, step=1)
-    ma_long  = st.number_input("장기 MA 기간", min_value=3, value=60, step=1)
-    if ma_short >= ma_long:
-        st.warning("이동평균: 단기 기간은 장기 기간보다 작아야 합니다.")
+# 선택한 전략들의 파라미터를 dict에 보관
+params = {}
 
-with st.sidebar.expander("거래량 돌파 (Volume Breakout)", expanded=True):
-    vol_window = st.number_input("거래량 평균 기간", min_value=2, value=20, step=1)
-    vol_mult   = st.number_input("거래량 배수 (예: 1.5)", min_value=0.1, value=1.5, step=0.1, format="%.2f")
-    up_thr_pct   = st.number_input("상승 임계 수익률(%)", value=1.0, step=0.1, format="%.2f")
-    down_thr_pct = st.number_input("하락 임계 수익률(%)", value=-1.0, step=0.1, format="%.2f")
+if "이동평균" in chosen_strategies:
+    with st.sidebar.expander("이동평균 (MA Cross)", expanded=True):
+        short_n = st.number_input("단기 MA 기간", min_value=2, value=20, step=1, key="ma_short")
+        long_n  = st.number_input("장기 MA 기간", min_value=3, value=60, step=1, key="ma_long")
+        if short_n >= long_n:
+            st.warning("이동평균: 단기 기간은 장기 기간보다 작아야 합니다.")
+        params["이동평균"] = {"short": int(short_n), "long": int(long_n)}
 
-with st.sidebar.expander("OBV 추세 (OBV Trend)", expanded=False):
-    obv_short = st.number_input("OBV 단기 기간", min_value=2, value=20, step=1)
-    obv_long  = st.number_input("OBV 장기 기간", min_value=3, value=60, step=1)
-    if obv_short >= obv_long:
-        st.warning("OBV: 단기 기간은 장기 기간보다 작아야 합니다.")
+if "거래량돌파" in chosen_strategies:
+    with st.sidebar.expander("거래량 돌파 (Volume Breakout)", expanded=True):
+        vol_window = st.number_input("거래량 평균 기간", min_value=2, value=20, step=1, key="vol_win")
+        vol_mult   = st.number_input("거래량 배수 (예: 1.5)", min_value=0.1, value=1.5, step=0.1, format="%.2f", key="vol_mult")
+        up_thr_pct   = st.number_input("상승 임계 수익률(%)", value=1.0, step=0.1, format="%.2f", key="up_thr")
+        down_thr_pct = st.number_input("하락 임계 수익률(%)", value=-1.0, step=0.1, format="%.2f", key="dn_thr")
+        params["거래량돌파"] = {
+            "win": int(vol_window), "mult": float(vol_mult),
+            "up": float(up_thr_pct), "dn": float(down_thr_pct)
+        }
 
-with st.sidebar.expander("VWAP", expanded=False):
-    vwap_window = st.number_input("VWAP 기간 (0=누적)", min_value=0, value=0, step=1)
-    vwap_alpha  = st.number_input("VWAP 필터 α(%) (0=미사용)", min_value=0.0, value=0.0, step=0.1, format="%.1f")
+if "OBV" in chosen_strategies:
+    with st.sidebar.expander("OBV 추세 (OBV Trend)", expanded=True):
+        obv_short = st.number_input("OBV 단기 기간", min_value=2, value=20, step=1, key="obv_short")
+        obv_long  = st.number_input("OBV 장기 기간", min_value=3, value=60, step=1, key="obv_long")
+        if obv_short >= obv_long:
+            st.warning("OBV: 단기 기간은 장기 기간보다 작아야 합니다.")
+        params["OBV"] = {"short": int(obv_short), "long": int(obv_long)}
+
+if "VWAP" in chosen_strategies:
+    with st.sidebar.expander("VWAP", expanded=True):
+        vwap_window = st.number_input("VWAP 기간 (0=누적)", min_value=0, value=0, step=1, key="vwap_win")
+        vwap_alpha  = st.number_input("VWAP 필터 α(%) (0=미사용)", min_value=0.0, value=0.0, step=0.1, format="%.1f", key="vwap_alpha")
+        params["VWAP"] = {"window": int(vwap_window), "alpha": float(vwap_alpha)}
 
 # --------------------- Strategy Implementations (use parameters) ---------------------
-def compute_ma_returns(df: pd.DataFrame, slippage: float, short_n: int, long_n: int) -> pd.Series:
+def compute_ma_returns(df: pd.DataFrame, short_n: int, long_n: int, slippage: float) -> pd.Series:
     d = df.copy()
     d["MA_Short"] = d["Close"].rolling(short_n).mean()
     d["MA_Long"]  = d["Close"].rolling(long_n).mean()
@@ -101,7 +115,7 @@ def compute_ma_returns(df: pd.DataFrame, slippage: float, short_n: int, long_n: 
     ret -= slippage * abs(d["Signal"].diff().fillna(0))
     return ret.dropna()
 
-def compute_vol_breakout_returns(df: pd.DataFrame, slippage: float, win: int, mult: float, up_thr: float, dn_thr: float) -> pd.Series:
+def compute_vol_breakout_returns(df: pd.DataFrame, win: int, mult: float, up_thr: float, dn_thr: float, slippage: float) -> pd.Series:
     d = df.copy()
     d["Vol_Avg"] = d["Volume"].rolling(win).mean()
     pct = d["Close"].pct_change()
@@ -112,7 +126,7 @@ def compute_vol_breakout_returns(df: pd.DataFrame, slippage: float, win: int, mu
     ret -= slippage * abs(d["Signal"].diff().fillna(0))
     return ret.dropna()
 
-def compute_obv_returns(df: pd.DataFrame, slippage: float, short_n: int, long_n: int) -> pd.Series:
+def compute_obv_returns(df: pd.DataFrame, short_n: int, long_n: int, slippage: float) -> pd.Series:
     d = df.copy()
     obv = [0]
     for i in range(1, len(d)):
@@ -130,12 +144,12 @@ def compute_obv_returns(df: pd.DataFrame, slippage: float, short_n: int, long_n:
     ret -= slippage * abs(d["Signal"].diff().fillna(0))
     return ret.dropna()
 
-def compute_vwap_returns(df: pd.DataFrame, slippage: float, window: int, alpha_pct: float) -> pd.Series:
+def compute_vwap_returns(df: pd.DataFrame, window: int, alpha_pct: float, slippage: float) -> pd.Series:
     d = df.copy()
     if window > 0:
         num = (d["Close"] * d["Volume"]).rolling(window).sum()
         den = d["Volume"].rolling(window).sum()
-        d["VWAP"] = num / (den.replace(0, np.nan))
+        d["VWAP"] = num / den.replace(0, np.nan)
     else:
         d["Cum_Vol"] = d["Volume"].cumsum()
         d["Cum_PV"]  = (d["Close"] * d["Volume"]).cumsum()
@@ -152,16 +166,15 @@ def compute_vwap_returns(df: pd.DataFrame, slippage: float, window: int, alpha_p
     ret -= slippage * abs(d["Signal"].diff().fillna(0))
     return ret.dropna()
 
-# 전략 이름 -> 함수 및 전달 파라미터 바인딩
 def run_strategy(name: str, df: pd.DataFrame) -> pd.Series:
     if name == "이동평균":
-        return compute_ma_returns(df, slippage, ma_short, ma_long)
+        p = params["이동평균"];  return compute_ma_returns(df, p["short"], p["long"], slippage)
     if name == "거래량돌파":
-        return compute_vol_breakout_returns(df, slippage, vol_window, vol_mult, up_thr_pct, down_thr_pct)
+        p = params["거래량돌파"]; return compute_vol_breakout_returns(df, p["win"], p["mult"], p["up"], p["dn"], slippage)
     if name == "OBV":
-        return compute_obv_returns(df, slippage, obv_short, obv_long)
+        p = params["OBV"];      return compute_obv_returns(df, p["short"], p["long"], slippage)
     if name == "VWAP":
-        return compute_vwap_returns(df, slippage, vwap_window, vwap_alpha)
+        p = params["VWAP"];     return compute_vwap_returns(df, p["window"], p["alpha"], slippage)
     raise ValueError("알 수 없는 전략 이름")
 
 # --------------------- Metrics ---------------------
@@ -236,4 +249,4 @@ with col2:
     out = pd.DataFrame(rows, columns=["전략", "초기자금", "최종자금", "CAGR", "승률", "MDD", "샤프"])
     st.dataframe(out, use_container_width=True)
 
-st.success("완료! 전략별 파라미터를 조정하며 결과를 비교해보세요.")
+st.success("완료! 선택한 전략만 파라미터가 표시됩니다.")
