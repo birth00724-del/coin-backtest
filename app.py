@@ -2,24 +2,19 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-from datetime import timedelta
 
 st.set_page_config(page_title="업비트 전략 백테스터", layout="wide")
 st.title("📈 업비트 전략 백테스터")
 st.caption("기본 CSV를 자동으로 불러오며, 필요하면 업로드로 교체할 수 있습니다. (필수 열: Date, Close, Volume)")
 
-# --------------------- Sidebar: Controls ---------------------
-st.sidebar.header("⚙️ 설정")
+# --------------------- Sidebar: Global Controls ---------------------
+st.sidebar.header("⚙️ 공통 설정")
 initial_capital = st.sidebar.number_input("초기자금", min_value=1.0, value=100.0, step=1.0)
-
-strategy_options = ["이동평균", "거래량돌파", "OBV", "VWAP"]
-chosen_strategies = st.sidebar.multiselect("전략 선택", strategy_options, default=["이동평균", "VWAP"])
-
 slippage_pct = st.sidebar.select_slider("슬리피지(%)", options=[0, 1, 2, 3, 4, 5], value=3)
 slippage = slippage_pct / 100.0
-
 years = st.sidebar.slider("분석 기간(년)", min_value=1, max_value=5, value=5, step=1)
 
+# 데이터 소스
 st.sidebar.markdown("---")
 st.sidebar.subheader("데이터 소스")
 uploaded = st.sidebar.file_uploader("CSV 업로드(선택)", type=["csv"])
@@ -32,7 +27,6 @@ def load_default_csv(path="upbit_fake_daily_data.csv") -> pd.DataFrame:
 
 data = None
 status_msg = ""
-
 try:
     if use_default:
         data = load_default_csv()
@@ -42,7 +36,6 @@ try:
 except FileNotFoundError:
     status_msg = "⚠️ 기본 CSV가 프로젝트 폴더에 없습니다. 업로드를 이용하세요."
 
-# 업로드가 있으면 업로드 파일로 교체
 if uploaded is not None:
     try:
         data = pd.read_csv(uploaded, parse_dates=["Date"], index_col="Date").sort_index()
@@ -54,75 +47,122 @@ if data is None:
     st.error("데이터가 없습니다. 기본 CSV를 폴더에 두거나 파일을 업로드해주세요.")
     st.stop()
 
-# 필수 컬럼 체크
 required_cols = {"Close", "Volume"}
-if not required_cols.issubset(set(data.columns)):
+if not required_cols.issubset(data.columns):
     st.error(f"CSV에 필수 열이 없습니다. 필요 열: {required_cols}. 현재 열: {list(data.columns)}")
     st.stop()
 
 st.success(status_msg)
 
-# --------------------- 기간 필터(최근 N년) ---------------------
+# 기간 필터: 최근 N년
 end = data.index.max()
 start = end - pd.DateOffset(years=years)
 data = data.loc[start:end].copy()
 
-# --------------------- Strategy Implementations ---------------------
-def compute_ma_returns(df: pd.DataFrame, slippage: float) -> pd.Series:
+# --------------------- Strategy selection ---------------------
+st.sidebar.markdown("---")
+st.sidebar.header("📌 전략 선택")
+strategy_options = ["이동평균", "거래량돌파", "OBV", "VWAP"]
+chosen_strategies = st.sidebar.multiselect("전략(복수 선택 가능)", strategy_options, default=["이동평균", "VWAP"])
+
+# --------------------- Strategy Parameters ---------------------
+st.sidebar.markdown("---")
+st.sidebar.header("🧪 전략 파라미터")
+
+with st.sidebar.expander("이동평균 (MA Cross)", expanded=True):
+    ma_short = st.number_input("단기 MA 기간", min_value=2, value=20, step=1)
+    ma_long  = st.number_input("장기 MA 기간", min_value=3, value=60, step=1)
+    if ma_short >= ma_long:
+        st.warning("이동평균: 단기 기간은 장기 기간보다 작아야 합니다.")
+
+with st.sidebar.expander("거래량 돌파 (Volume Breakout)", expanded=True):
+    vol_window = st.number_input("거래량 평균 기간", min_value=2, value=20, step=1)
+    vol_mult   = st.number_input("거래량 배수 (예: 1.5)", min_value=0.1, value=1.5, step=0.1, format="%.2f")
+    up_thr_pct   = st.number_input("상승 임계 수익률(%)", value=1.0, step=0.1, format="%.2f")
+    down_thr_pct = st.number_input("하락 임계 수익률(%)", value=-1.0, step=0.1, format="%.2f")
+
+with st.sidebar.expander("OBV 추세 (OBV Trend)", expanded=False):
+    obv_short = st.number_input("OBV 단기 기간", min_value=2, value=20, step=1)
+    obv_long  = st.number_input("OBV 장기 기간", min_value=3, value=60, step=1)
+    if obv_short >= obv_long:
+        st.warning("OBV: 단기 기간은 장기 기간보다 작아야 합니다.")
+
+with st.sidebar.expander("VWAP", expanded=False):
+    vwap_window = st.number_input("VWAP 기간 (0=누적)", min_value=0, value=0, step=1)
+    vwap_alpha  = st.number_input("VWAP 필터 α(%) (0=미사용)", min_value=0.0, value=0.0, step=0.1, format="%.1f")
+
+# --------------------- Strategy Implementations (use parameters) ---------------------
+def compute_ma_returns(df: pd.DataFrame, slippage: float, short_n: int, long_n: int) -> pd.Series:
     d = df.copy()
-    d["MA_Short"] = d["Close"].rolling(20).mean()
-    d["MA_Long"]  = d["Close"].rolling(60).mean()
-    d["Signal"] = np.where(d["MA_Short"] > d["MA_Long"], 1, -1)
+    d["MA_Short"] = d["Close"].rolling(short_n).mean()
+    d["MA_Long"]  = d["Close"].rolling(long_n).mean()
+    d["Signal"]   = np.where(d["MA_Short"] > d["MA_Long"], 1, -1)
     ret = d["Signal"].shift(1) * d["Close"].pct_change()
     ret -= slippage * abs(d["Signal"].diff().fillna(0))
     return ret.dropna()
 
-def compute_vol_breakout_returns(df: pd.DataFrame, slippage: float) -> pd.Series:
+def compute_vol_breakout_returns(df: pd.DataFrame, slippage: float, win: int, mult: float, up_thr: float, dn_thr: float) -> pd.Series:
     d = df.copy()
-    d["Vol_Avg"] = d["Volume"].rolling(20).mean()
-    signal = np.where(
-        (d["Volume"] > 1.5 * d["Vol_Avg"]) & (d["Close"].pct_change() > 0.01), 1,
-        np.where((d["Volume"] > 1.5 * d["Vol_Avg"]) & (d["Close"].pct_change() < -0.01), -1, 0)
-    )
-    d["Signal"] = signal
-    ret = d["Signal"].shift(1) * d["Close"].pct_change()
+    d["Vol_Avg"] = d["Volume"].rolling(win).mean()
+    pct = d["Close"].pct_change()
+    cond_up = (d["Volume"] > mult * d["Vol_Avg"]) & (pct >  up_thr / 100.0)
+    cond_dn = (d["Volume"] > mult * d["Vol_Avg"]) & (pct <  dn_thr / 100.0)
+    d["Signal"] = np.where(cond_up, 1, np.where(cond_dn, -1, 0))
+    ret = d["Signal"].shift(1) * pct
     ret -= slippage * abs(d["Signal"].diff().fillna(0))
     return ret.dropna()
 
-def compute_obv_returns(df: pd.DataFrame, slippage: float) -> pd.Series:
+def compute_obv_returns(df: pd.DataFrame, slippage: float, short_n: int, long_n: int) -> pd.Series:
     d = df.copy()
     obv = [0]
     for i in range(1, len(d)):
-        if d["Close"].iloc[i] > d["Close"].iloc[i - 1]:
+        if d["Close"].iloc[i] > d["Close"].iloc[i-1]:
             obv.append(obv[-1] + d["Volume"].iloc[i])
-        elif d["Close"].iloc[i] < d["Close"].iloc[i - 1]:
+        elif d["Close"].iloc[i] < d["Close"].iloc[i-1]:
             obv.append(obv[-1] - d["Volume"].iloc[i])
         else:
             obv.append(obv[-1])
     d["OBV"] = obv
-    d["OBV_Short"] = d["OBV"].rolling(20).mean()
-    d["OBV_Long"]  = d["OBV"].rolling(60).mean()
-    d["Signal"] = np.where(d["OBV_Short"] > d["OBV_Long"], 1, -1)
+    d["OBV_Short"] = d["OBV"].rolling(short_n).mean()
+    d["OBV_Long"]  = d["OBV"].rolling(long_n).mean()
+    d["Signal"]    = np.where(d["OBV_Short"] > d["OBV_Long"], 1, -1)
     ret = d["Signal"].shift(1) * d["Close"].pct_change()
     ret -= slippage * abs(d["Signal"].diff().fillna(0))
     return ret.dropna()
 
-def compute_vwap_returns(df: pd.DataFrame, slippage: float) -> pd.Series:
+def compute_vwap_returns(df: pd.DataFrame, slippage: float, window: int, alpha_pct: float) -> pd.Series:
     d = df.copy()
-    d["Cum_Vol"] = d["Volume"].cumsum()
-    d["Cum_PV"]  = (d["Close"] * d["Volume"]).cumsum()
-    d["VWAP"]    = d["Cum_PV"] / d["Cum_Vol"]
-    d["Signal"] = np.where(d["Close"] > d["VWAP"], 1, -1)
+    if window > 0:
+        num = (d["Close"] * d["Volume"]).rolling(window).sum()
+        den = d["Volume"].rolling(window).sum()
+        d["VWAP"] = num / (den.replace(0, np.nan))
+    else:
+        d["Cum_Vol"] = d["Volume"].cumsum()
+        d["Cum_PV"]  = (d["Close"] * d["Volume"]).cumsum()
+        d["VWAP"]    = d["Cum_PV"] / d["Cum_Vol"].replace(0, np.nan)
+
+    if alpha_pct > 0:
+        up = d["Close"] > d["VWAP"] * (1 + alpha_pct/100.0)
+        dn = d["Close"] < d["VWAP"] * (1 - alpha_pct/100.0)
+        d["Signal"] = np.where(up, 1, np.where(dn, -1, 0))
+    else:
+        d["Signal"] = np.where(d["Close"] > d["VWAP"], 1, -1)
+
     ret = d["Signal"].shift(1) * d["Close"].pct_change()
     ret -= slippage * abs(d["Signal"].diff().fillna(0))
     return ret.dropna()
 
-strategy_funcs = {
-    "이동평균": compute_ma_returns,
-    "거래량돌파": compute_vol_breakout_returns,
-    "OBV": compute_obv_returns,
-    "VWAP": compute_vwap_returns,
-}
+# 전략 이름 -> 함수 및 전달 파라미터 바인딩
+def run_strategy(name: str, df: pd.DataFrame) -> pd.Series:
+    if name == "이동평균":
+        return compute_ma_returns(df, slippage, ma_short, ma_long)
+    if name == "거래량돌파":
+        return compute_vol_breakout_returns(df, slippage, vol_window, vol_mult, up_thr_pct, down_thr_pct)
+    if name == "OBV":
+        return compute_obv_returns(df, slippage, obv_short, obv_long)
+    if name == "VWAP":
+        return compute_vwap_returns(df, slippage, vwap_window, vwap_alpha)
+    raise ValueError("알 수 없는 전략 이름")
 
 # --------------------- Metrics ---------------------
 def curve_from_returns(returns: pd.Series, init_cap: float) -> pd.Series:
@@ -138,7 +178,7 @@ def metrics_from_curve(curve: pd.Series, rf_daily: float = 0.0001):
     win_rate = (daily_ret > 0).mean()
     return final_cap, cagr, mdd, sharpe, win_rate
 
-# --------------------- Compute ---------------------
+# --------------------- Compute & Output ---------------------
 if not chosen_strategies:
     st.warning("전략을 최소 1개 이상 선택하세요.")
     st.stop()
@@ -146,7 +186,7 @@ if not chosen_strategies:
 curves = {}
 rows = []
 for name in chosen_strategies:
-    ret = strategy_funcs[name](data, slippage)
+    ret = run_strategy(name, data)
     curve = curve_from_returns(ret, initial_capital)
     final_cap, cagr, mdd, sharpe, win_rate = metrics_from_curve(curve)
     curves[name] = curve
@@ -196,4 +236,4 @@ with col2:
     out = pd.DataFrame(rows, columns=["전략", "초기자금", "최종자금", "CAGR", "승률", "MDD", "샤프"])
     st.dataframe(out, use_container_width=True)
 
-st.success("완료! 기본 CSV 자동 로드, 업로드 시 교체가 가능합니다.")
+st.success("완료! 전략별 파라미터를 조정하며 결과를 비교해보세요.")
