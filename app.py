@@ -27,11 +27,14 @@ st.sidebar.markdown("---")
 st.sidebar.info("CSV에는 최소 열(Date, Close, Volume)이 필요합니다.")
 
 # --------------------- Data Input ---------------------
-uploaded = st.file_uploader("CSV 업로드 (upbit_fake_daily_data.csv)", type=["csv"])
-if uploaded is None:
+# 업로드 버튼 대신 자동 로딩
+try:
+    data = pd.read_csv("upbit_fake_daily_data.csv", parse_dates=["Date"], index_col="Date").sort_index()
+    st.success("✅ 기본 데이터 파일(upbit_fake_daily_data.csv)을 불러왔습니다.")
+except FileNotFoundError:
+    st.error("❌ upbit_fake_daily_data.csv 파일이 프로젝트 폴더에 없습니다.")
     st.stop()
 
-data = pd.read_csv(uploaded, parse_dates=["Date"], index_col="Date").sort_index()
 
 # 기간 필터: 최근 N년
 end = data.index.max()
